@@ -13,4 +13,5 @@ jobs:
       run: |
         sudo apt install build-essential libgmp-dev z3
         sudo apt install opam
+        opam --version
         etc/ci_opam_latest_build.sh
