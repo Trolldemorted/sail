@@ -63,6 +63,9 @@ jobs:
       run: |
         eval $(opam env)
         etc/ci_core_tests.sh
+        git clone https://github.com/rems-project/sail-arm.git
+        cd ./sail-arm/arm-v9.4-a/
+        make
 
   build-docker:
     runs-on: "ubuntu-latest"
