@@ -1,0 +1,45 @@
+name: JSON backend verify
+
+on: [push, pull_request, workflow_dispatch]
+
+# This workflow builds sail from the current checkout and runs the
+# `sail --json` backend against the test/json fixtures, piping the
+# output through scripts/verify_json.py. It is a smoke test for the
+# JSON backend, not a full strict gate on sail-riscv (that is tracked
+# separately; see /tmp/rewriterchange.md Work item 4).
+permissions:
+  contents: read
+
+jobs:
+  verify-json:
+    strategy:
+      matrix:
+        ocaml_version: [5.2.1]
+        os: [ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: System dependencies
+      if: runner.os == 'Linux'
+      run: sudo apt install build-essential libgmp-dev z3 cvc4 pkg-config
+
+    - name: Setup OCaml (opam)
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: ${{ matrix.ocaml_version }}
+        dune-cache: true
+
+    - name: Pin dependencies
+      run: opam pin add sail . --no-action
+
+    - name: Install dependencies
+      run: opam install --deps-only sail
+
+    - name: Build
+      run: opam install sail --verbose
+
+    - name: Run JSON backend tests
+      run: |
+        cd test/json
+        python3 run_tests.py
