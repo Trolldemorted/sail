@@ -57,6 +57,17 @@ val opt_auto_mono : bool ref
 val opt_dall_split_errors : bool ref
 val opt_dmono_continue : bool ref
 
+(** Comma-separated list of entry-point ids for the `filter_unreachable` rewriter.
+    Read at run time by the rewriter. *)
+val opt_filter_unreachable_roots : string ref
+
+(** When true, the `drop_uninstantiated_polymorphic` rewriter drops
+    every top-level definition that still contains a polymorphic
+    marker after monomorphisation. Read at run time so the option can
+    be set from the command line after the rewriter pipeline is
+    registered. *)
+val opt_drop_uninstantiated_polymorphic : bool ref
+
 (** Unroll loops with constant bounds if less than 'max_iter' iterations *)
 val opt_unroll_loops : bool ref
 
@@ -128,3 +139,5 @@ val rewrite :
 val rewrites_interpreter : (string * rewriter_arg list) list
 
 val simple_typ : typ -> typ
+
+val pat_to_exp : Env.t -> tannot pat -> tannot exp

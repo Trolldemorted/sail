@@ -4166,13 +4166,35 @@ let move_termination_measures env ast =
   let called_output = ref IdSet.empty in
   let rec aux acc = function
     | [] -> List.rev acc
-    | (DEF_aux (DEF_fundef (FD_aux (FD_function (r, ty, fs), (l, f_ann))), def_annot) as d) :: t -> begin
+    | (DEF_aux (DEF_fundef fd, def_annot) as d) :: t -> begin
+        match aux_fd fd with
+        | None -> aux (d :: acc) t
+        | Some (new_fd, moved_val_specs) ->
+            let new_def = DEF_aux (DEF_fundef new_fd, def_annot) in
+            aux ((new_def :: moved_val_specs) @ acc) t
+      end
+    | (DEF_aux (DEF_internal_mutrec fds, def_annot) as d) :: t -> begin
+        match Util.map_changed_default (fun x -> (x, [])) aux_fd fds with
+        | None -> aux (d :: acc) t
+        | Some xs ->
+            let new_fds, moved_val_specss = List.split xs in
+            let new_def = DEF_aux (DEF_internal_mutrec new_fds, def_annot) in
+            aux ((new_def :: List.concat moved_val_specss) @ acc) t
+      end
+    | DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, _), _)), _) :: t when IdSet.mem id !called_output -> aux acc t
+    | (DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, _), _)), _) as d) :: t ->
+        called_output := IdSet.add id !called_output;
+        aux (d :: acc) t
+    | DEF_aux (DEF_measure _, _) :: t -> aux acc t
+    | h :: t -> aux (h :: acc) t
+  and aux_fd = function
+    | FD_aux (FD_function (r, ty, fs), (l, f_ann)) -> begin
         let id = match fs with [] -> assert false (* TODO *) | FCL_aux (FCL_funcl (id, _), _) :: _ -> id in
         match Bindings.find_opt id measures with
-        | None -> aux (d :: acc) t
+        | None -> None
         | Some (pat, exp, called_fns) ->
             let r = Rec_aux (Rec_measure (pat, exp), Generated l) in
-            let new_def = DEF_aux (DEF_fundef (FD_aux (FD_function (r, ty, fs), (l, f_ann))), def_annot) in
+            let new_fd = FD_aux (FD_function (r, ty, fs), (l, f_ann)) in
             let moved_val_specs =
               List.fold_left
                 (fun moved id ->
@@ -4184,14 +4206,8 @@ let move_termination_measures env ast =
                 )
                 [] called_fns
             in
-            aux ((new_def :: moved_val_specs) @ acc) t
+            Some (new_fd, moved_val_specs)
       end
-    | DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, _), _)), _) :: t when IdSet.mem id !called_output -> aux acc t
-    | (DEF_aux (DEF_val (VS_aux (VS_val_spec (_, id, _), _)), _) as d) :: t ->
-        called_output := IdSet.add id !called_output;
-        aux (d :: acc) t
-    | DEF_aux (DEF_measure _, _) :: t -> aux acc t
-    | h :: t -> aux (h :: acc) t
   in
   let ast = { ast with defs = aux [] ast.defs } in
   move_loop_measures ast
@@ -4246,8 +4262,24 @@ let rewrite_explicit_measure effect_info env ast =
     let loc = Parse_ast.Generated (fst fcl_ann).loc in
     let P_aux (pat, pann), guard, body, ann = destruct_pexp pexp in
     let extra_pat = P_aux (P_id limit, (loc, empty_tannot)) in
-    let pat =
-      match pat with P_tuple pats -> P_tuple (pats @ [extra_pat]) | p -> P_tuple [P_aux (p, pann); extra_pat]
+    let _, fn_typ = Env.get_val_spec id (env_of_tannot (snd fcl_ann)) in
+    let pat, rebind =
+      match pat with
+      | P_tuple pats -> (P_tuple (pats @ [extra_pat]), fun e -> e)
+      | p -> (
+          (* If the arguments are matched by a single pattern, break it up to add the new one then rebind it later *)
+          match fn_typ with
+          | Typ_aux (Typ_fn ((_ :: _ :: _ as args), _), _) ->
+              let mk_arg_pat i _typ = P_aux (P_id (mk_id ("arg#" ^ string_of_int i)), (loc, empty_tannot)) in
+              let mk_arg_exp i _typ = E_aux (E_id (mk_id ("arg#" ^ string_of_int i)), (loc, empty_tannot)) in
+              let pats = List.mapi mk_arg_pat args in
+              let exps = List.mapi mk_arg_exp args in
+              let rebind body =
+                E_aux (E_let (P_aux (p, pann), E_aux (E_tuple exps, (loc, empty_tannot)), body), (loc, empty_tannot))
+              in
+              (P_tuple (pats @ [extra_pat]), rebind)
+          | _ -> (P_tuple [P_aux (p, pann); extra_pat], fun e -> e)
+        )
     in
     let assert_exp =
       E_aux
@@ -4288,7 +4320,7 @@ let rewrite_explicit_measure effect_info env ast =
         }
         body
     in
-    let body = E_aux (E_block [assert_exp; body], (loc, empty_tannot)) in
+    let body = rebind (E_aux (E_block [assert_exp; body], (loc, empty_tannot))) in
     let new_id = rec_id id in
     effect_info := Effects.copy_function_effect id !effect_info new_id;
     FCL_aux (FCL_funcl (new_id, construct_pexp (P_aux (pat, pann), guard, body, ann)), fcl_ann)
@@ -4733,6 +4765,298 @@ let rewrite_remove_extern_defs target env ast =
 
 let opt_mono_rewrites = ref false
 let opt_mono_complex_nexps = ref true
+let opt_filter_unreachable_roots : string ref = ref ""
+let opt_drop_uninstantiated_polymorphic : bool ref = ref false
+
+(* Returns true if [t] (an [Ast.typ]) contains a polymorphic marker: a
+   free kid variable (Typ_var), an unresolved nexp variable (Nexp_var),
+   or - for top-level typquant containers - a TypQ_tq with remaining
+   quantifiers. *)
+let rec nexp_has_poly_marker (n : nexp) =
+  match n with
+  | Nexp_aux (Nexp_var _, _) -> true
+  | Nexp_aux (Nexp_id _, _) -> false
+  | Nexp_aux (Nexp_constant _, _) -> false
+  | Nexp_aux (Nexp_app (_, args), _) -> List.exists nexp_has_poly_marker args
+  | Nexp_aux (Nexp_times (a, b), _) | Nexp_aux (Nexp_sum (a, b), _) ->
+      nexp_has_poly_marker a || nexp_has_poly_marker b
+  | Nexp_aux (Nexp_minus (a, b), _) -> nexp_has_poly_marker a || nexp_has_poly_marker b
+  | Nexp_aux (Nexp_exp n, _) -> nexp_has_poly_marker n
+  | Nexp_aux (Nexp_neg n, _) -> nexp_has_poly_marker n
+  | Nexp_aux (Nexp_if (c, t, e), _) ->
+      nc_has_poly c || nexp_has_poly_marker t || nexp_has_poly_marker e
+
+and nc_has_poly (c : n_constraint) =
+  match c with
+  | NC_aux (NC_var _, _) -> true
+  | NC_aux (NC_id _, _) -> false
+  | NC_aux (NC_true, _) | NC_aux (NC_false, _) -> false
+  | NC_aux (NC_equal (a, b), _) | NC_aux (NC_not_equal (a, b), _) -> (
+      match (a, b) with
+      | A_aux (A_nexp n, _), _ | _, A_aux (A_nexp n, _) -> nexp_has_poly_marker n
+      | _ -> false)
+  | NC_aux (NC_ge (a, b), _)
+  | NC_aux (NC_gt (a, b), _)
+  | NC_aux (NC_le (a, b), _)
+  | NC_aux (NC_lt (a, b), _) ->
+      nexp_has_poly_marker a || nexp_has_poly_marker b
+  | NC_aux (NC_set (n, _), _) -> nexp_has_poly_marker n
+  | NC_aux (NC_and (a, b), _) | NC_aux (NC_or (a, b), _) -> nc_has_poly a || nc_has_poly b
+  | NC_aux (NC_app (_, args), _) ->
+      List.exists
+        (function A_aux (A_nexp n, _) -> nexp_has_poly_marker n | _ -> false)
+        args
+
+let rec typ_has_poly_marker (t : typ) =
+  let check_typ_arg = function
+    | A_aux (A_nexp (Nexp_aux (Nexp_var _, _)), _) -> true
+    | A_aux (A_typ t, _) -> typ_has_poly_marker t
+    | A_aux (A_nexp n, _) -> nexp_has_poly_marker n
+    | A_aux (A_bool _, _) -> false
+  in
+  match t with
+  | Typ_aux (Typ_id _, _) -> false
+  | Typ_aux (Typ_var _, _) -> true
+  | Typ_aux (Typ_fn (args, ret), _) -> List.exists typ_has_poly_marker (args @ [ret])
+  | Typ_aux (Typ_bidir (a, b), _) -> typ_has_poly_marker a || typ_has_poly_marker b
+  | Typ_aux (Typ_tuple ts, _) -> List.exists typ_has_poly_marker ts
+  | Typ_aux (Typ_app (_, args), _) -> List.exists check_typ_arg args
+  | Typ_aux (Typ_exist (kids, c, t), _) ->
+      let kids_set =
+        List.fold_left
+          (fun acc ki ->
+            match ki with
+            | KOpt_aux (KOpt_kind (_, kid), _) -> KidSet.add kid acc)
+          KidSet.empty kids
+      in
+      let c_has_poly =
+        let rec walk_nc = function
+          | NC_aux (NC_var kid, _) -> not (KidSet.mem kid kids_set)
+          | NC_aux (NC_app (_, args), _) ->
+              List.exists
+                (function
+                  | A_aux (A_nexp (Nexp_aux (Nexp_var kid, _)), _) ->
+                      not (KidSet.mem kid kids_set)
+                  | A_aux (A_nexp n, _) -> nexp_has_poly_marker n
+                  | _ -> false)
+                args
+          | NC_aux (NC_and (a, b), _) | NC_aux (NC_or (a, b), _) -> walk_nc a || walk_nc b
+          | NC_aux (NC_equal (a, b), _) | NC_aux (NC_not_equal (a, b), _) -> (
+              match (a, b) with
+              | A_aux (A_nexp (Nexp_aux (Nexp_var kid, _)), _), _
+              | _, A_aux (A_nexp (Nexp_aux (Nexp_var kid, _)), _) ->
+                  not (KidSet.mem kid kids_set)
+              | A_aux (A_nexp n, _), _ | _, A_aux (A_nexp n, _) -> nexp_has_poly_marker n
+              | _ -> false)
+          | _ -> false
+        in
+        walk_nc c
+      in
+      c_has_poly || typ_has_poly_marker t
+  | Typ_aux (Typ_internal_unknown, _) -> false
+
+(* Walk a typquant and return true if it still binds polymorphic
+   quantifiers that the monomorphiser hasn't eliminated. *)
+let typquant_has_poly_marker (tq : typquant) =
+  match tq with
+  | TypQ_aux (TypQ_no_forall, _) -> false
+  | TypQ_aux (TypQ_tq items, _) ->
+      List.exists
+        (function
+          | QI_aux (QI_id _, _) -> true
+          | QI_aux (QI_constraint c, _) -> nc_has_poly c)
+        items
+
+(* Walk the body of a definition looking for any polymorphic marker.
+   Used by [drop_uninstantiated_polymorphic] to decide whether to drop
+   the def. *)
+let rec funcl_has_poly_marker (pe : tannot pexp) =
+  let check_pat (p : tannot pat) =
+    match p with
+    | P_aux (P_typ (t, _), _) -> typ_has_poly_marker t
+    | _ -> false
+  in
+  match pe with
+  | Pat_aux (Pat_exp (p, e), _) -> check_pat p || exp_has_poly_marker e
+  | Pat_aux (Pat_when (p, c, e), _) ->
+      check_pat p || exp_has_poly_marker c || exp_has_poly_marker e
+
+and exp_has_poly_marker (e : tannot exp) =
+  match e with
+  | E_aux (E_block es, _) -> List.exists exp_has_poly_marker es
+  | E_aux (E_id _, _) -> false
+  | E_aux (E_lit _, _) -> false
+  | E_aux (E_typ (t, e), _) -> typ_has_poly_marker t || exp_has_poly_marker e
+  | E_aux (E_app (_, args), _) -> List.exists exp_has_poly_marker args
+  | E_aux (E_tuple es, _) -> List.exists exp_has_poly_marker es
+  | E_aux (E_if (a, b, c), _) ->
+      exp_has_poly_marker a || exp_has_poly_marker b || exp_has_poly_marker c
+  | E_aux (E_loop (_, _, c, b), _) -> exp_has_poly_marker c || exp_has_poly_marker b
+  | E_aux (E_for (_, a, b, c, _, body), _) ->
+      List.exists exp_has_poly_marker [a; b; c; body]
+  | E_aux (E_vector es, _) -> List.exists exp_has_poly_marker es
+  | E_aux (E_vector_append (a, b), _) | E_aux (E_cons (a, b), _) ->
+      exp_has_poly_marker a || exp_has_poly_marker b
+  | E_aux (E_list es, _) -> List.exists exp_has_poly_marker es
+  | E_aux (E_struct (_, fields), _) ->
+      List.exists (fun (FE_aux (FE_fexp (_, e), _)) -> exp_has_poly_marker e) fields
+  | E_aux (E_struct_update (e, fields), _) ->
+      exp_has_poly_marker e
+      || List.exists (fun (FE_aux (FE_fexp (_, e), _)) -> exp_has_poly_marker e) fields
+  | E_aux (E_field (e, _), _) -> exp_has_poly_marker e
+  | E_aux (E_match (e, arms), _) ->
+      exp_has_poly_marker e || List.exists funcl_has_poly_marker arms
+  | E_aux (E_let (p, a, b), _) -> exp_has_poly_marker a || exp_has_poly_marker b
+  | E_aux (E_assign (le, e), _) -> lexp_has_poly_marker le || exp_has_poly_marker e
+  | E_aux (E_sizeof n, _) -> nexp_has_poly_marker n
+  | E_aux (E_return e, _) -> exp_has_poly_marker e
+  | E_aux (E_exit e, _) -> exp_has_poly_marker e
+  | E_aux (E_config _, _) -> false
+  | E_aux (E_ref _, _) -> false
+  | E_aux (E_throw e, _) -> exp_has_poly_marker e
+  | E_aux (E_try (e, arms), _) -> exp_has_poly_marker e || List.exists funcl_has_poly_marker arms
+  | E_aux (E_assert (a, b), _) -> exp_has_poly_marker a || exp_has_poly_marker b
+  | E_aux (E_var (le, a, b), _) ->
+      lexp_has_poly_marker le || exp_has_poly_marker a || exp_has_poly_marker b
+  | E_aux (E_undef, _) -> false
+  | E_aux (E_internal_plet (p, a, b), _) -> exp_has_poly_marker a || exp_has_poly_marker b
+  | E_aux (E_internal_return e, _) -> exp_has_poly_marker e
+  | E_aux (E_internal_value _, _) -> false
+  | E_aux (E_internal_assume (c, e), _) -> nc_has_poly c || exp_has_poly_marker e
+  | E_aux (E_constraint c, _) -> nc_has_poly c
+
+and lexp_has_poly_marker (le : tannot lexp) =
+  match le with
+  | LE_aux (LE_id _, _) -> false
+  | LE_aux (LE_deref e, _) -> exp_has_poly_marker e
+  | LE_aux (LE_app (_, args), _) -> List.exists exp_has_poly_marker args
+  | LE_aux (LE_typ (t, _), _) -> typ_has_poly_marker t
+  | LE_aux (LE_tuple les, _) -> List.exists lexp_has_poly_marker les
+  | LE_aux (LE_vector_concat les, _) -> List.exists lexp_has_poly_marker les
+  | LE_aux (LE_vector (le, e), _) -> lexp_has_poly_marker le || exp_has_poly_marker e
+  | LE_aux (LE_vector_range (le, a, b), _) ->
+      lexp_has_poly_marker le || exp_has_poly_marker a || exp_has_poly_marker b
+  | LE_aux (LE_field (le, _), _) -> lexp_has_poly_marker le
+
+(* Walk a fundef and return true if any polymorphic marker survives. *)
+let funcl_has_poly_marker_funcl (FCL_aux (FCL_funcl (_, pe), _) : tannot funcl) =
+  funcl_has_poly_marker pe
+
+let fundef_has_poly_marker (fd : tannot fundef) =
+  let open Ast in
+  match fd with
+  | FD_aux (FD_function (_, tao, fcls), _) -> (
+      match tao with
+      | Typ_annot_opt_aux (Typ_annot_opt_some (tq, t), _) ->
+          typquant_has_poly_marker tq
+          || typ_has_poly_marker t
+          || List.exists funcl_has_poly_marker_funcl fcls
+      | _ -> List.exists funcl_has_poly_marker_funcl fcls)
+
+(* Decide whether a top-level def has un-resolvable polymorphic content.
+   Extern val-specs are kept intact (Option A from the plan's contract
+   discussion). *)
+let rec def_has_poly_marker (def : (tannot, Env.t) def) =
+  match def with
+  | DEF_aux (DEF_fundef fd, _) -> fundef_has_poly_marker fd
+  | DEF_aux (DEF_internal_mutrec fds, _) -> List.exists fundef_has_poly_marker fds
+  | DEF_aux (DEF_type td, _) -> type_def_has_poly_marker td
+  | DEF_aux (DEF_val _, _) -> false
+  | _ -> false
+
+and type_def_has_poly_marker (TD_aux (aux, _) : tannot type_def) =
+  let open Ast in
+  match aux with
+  | TD_abbrev (_, tq, ta) ->
+      typquant_has_poly_marker tq
+      ||
+      (match ta with
+       | A_aux (A_typ t, _) -> typ_has_poly_marker t
+       | A_aux (A_nexp n, _) -> nexp_has_poly_marker n
+       | _ -> false)
+  | TD_record (_, tq, fields, _) ->
+      typquant_has_poly_marker tq
+      || List.exists (fun ((_, t), _) -> typ_has_poly_marker t) fields
+  | TD_variant (_, tq, unions, _) ->
+      typquant_has_poly_marker tq
+      || List.exists
+           (fun (Tu_aux (Tu_ty_id (t, _), _)) -> typ_has_poly_marker t)
+           unions
+  | TD_enum (_, _members, _) -> false
+  | TD_abstract _ -> false
+  | TD_bitfield (_, t, _) -> typ_has_poly_marker t
+
+(* Drop every top-level definition that still contains a polymorphic
+   marker after monomorphisation runs. [DEF_val] extern declarations
+   are intentionally kept because they are signatures and may stay
+   polymorphic per the chosen contract (Option A from the plan's
+   findings doc). The rewriter reads the ref at run time so the option
+   can be set from the command line after the rewriter pipeline is
+   registered but before it is executed. *)
+let rewrite_drop_uninstantiated_polymorphic _env (ast : typed_ast) =
+  if not !opt_drop_uninstantiated_polymorphic then ast
+  else
+    let kept, dropped =
+      List.partition (fun d -> not (def_has_poly_marker d)) ast.defs
+    in
+    let name_of d =
+      match d with
+      | DEF_aux (DEF_fundef fd, _) -> (
+          match fd with
+          | FD_aux (FD_function (_, _, fcls), _) -> (
+              match fcls with
+              | FCL_aux (FCL_funcl (id, _), _) :: _ -> string_of_id id
+              | [] -> "<anonymous>"))
+      | DEF_aux (DEF_internal_mutrec (fd :: _), _) -> (
+          match fd with
+          | FD_aux (FD_function (_, _, fcls), _) -> (
+              match fcls with
+              | FCL_aux (FCL_funcl (id, _), _) :: _ -> string_of_id id
+              | [] -> "<anonymous>"))
+      | DEF_aux (DEF_type td, _) -> (
+          match td with
+          | TD_aux (TD_abbrev (id, _, _), _) -> string_of_id id
+          | TD_aux (TD_record (id, _, _, _), _) -> string_of_id id
+          | TD_aux (TD_variant (id, _, _, _), _) -> string_of_id id
+          | TD_aux (TD_enum (id, _, _), _) -> string_of_id id
+          | TD_aux (TD_bitfield (id, _, _), _) -> string_of_id id
+          | TD_aux (TD_abstract (id, _, _), _) -> string_of_id id)
+      | _ -> "<unknown>"
+    in
+    List.iter
+      (fun d ->
+        Printf.eprintf "sail-plugin-json: dropping polymorphic definition: %s\n%!" (name_of d))
+      dropped;
+    { ast with defs = kept }
+
+(* Drop every top-level definition that is not transitively reachable from
+   the function-typed entry points listed in [opt_filter_unreachable_roots]
+   (comma-separated). Used by the JSON backend to remove definitions whose
+   polymorphic kid variables the SAIL monomorphiser cannot resolve, so they
+   never enter the monomorphise pipeline. The user has stated that
+   unreachable code is "no concern of mine" and may be discarded.
+
+   The rewriter reads the ref at run time so the option can be set from the
+   command line (e.g. via a target's --json-roots flag) after the rewriter
+   pipeline is registered but before it is executed. *)
+let rewrite_filter_unreachable _target _env ast =
+  let roots_csv = !opt_filter_unreachable_roots in
+  match roots_csv with
+  | "" -> ast
+  | _ ->
+      let root_ids =
+        roots_csv
+        |> String.split_on_char ','
+        |> List.filter (fun s -> s <> "")
+        |> List.map mk_id
+        |> IdSet.of_list
+      in
+      let g = Callgraph.graph_of_ast ast in
+      let roots =
+        root_ids |> IdSet.elements |> List.map (fun id -> Callgraph.Function id) |> Callgraph.NodeSet.of_list
+      in
+      let g = Callgraph.G.prune roots Callgraph.NodeSet.empty g in
+      Callgraph.filter_ast_extra Callgraph.NodeSet.empty g ast false
 
 let mono_rewrites env defs = if !opt_mono_rewrites then Monomorphise.mono_rewrites defs else defs
 
@@ -4929,6 +5253,8 @@ let all_rewriters =
     ("toplevel_let_patterns", basic_rewriter rewrite_toplevel_let_patterns);
     ("remove_bitfield_records", basic_rewriter remove_bitfield_records);
     ("remove_extern_defs", String_rewriter (fun target -> basic_rewriter (rewrite_remove_extern_defs target)));
+    ("filter_unreachable", String_rewriter (fun roots -> basic_rewriter (rewrite_filter_unreachable roots)));
+    ("drop_uninstantiated_polymorphic", basic_rewriter rewrite_drop_uninstantiated_polymorphic);
   ]
 
 let rewrites_interpreter =

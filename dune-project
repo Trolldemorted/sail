@@ -110,6 +110,12 @@ http://www.cl.cam.ac.uk/~pes20/sail/.
     (libsail (= :version))))
 
 (package
+  (name sail_json_backend)
+  (synopsis "Sail to JSON translation")
+  (depends
+    (libsail (= :version))))
+
+(package
   (name sail_latex_backend)
   (synopsis "Sail to LaTeX formatting")
   (depends
